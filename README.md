@@ -17,10 +17,10 @@ reporting PPO+RNN beats it by roughly 40% across three separate test years
 
 ## Status
 
-**Data pipeline: done and verified.** Model implementation (environment,
-reward, PPO+RNN agent, train/evaluate scripts) is not started yet -- this
-README describes the paper and the data as they stand today; the RL parts
-below are the paper's design, not yet this repo's code.
+**Data pipeline and RL implementation both done, verified end-to-end on
+real 2018 PJM data.** See "Known findings" below for actual results. Only
+2018 has been trained/evaluated so far; 2016 and 2017 (the paper's other
+two case-study years) are not yet run.
 
 ## Data
 
@@ -126,12 +126,131 @@ data/    # not tracked in git -- rebuild locally via the scripts above
   test/  pjm_rto_rt_hourly_lmp_<year>_test.csv  (Oct-Dec, per year)
 ```
 
+## Model
+
+`src/environment.py` -- state `(E_t, c_t, rho_t, h_t)`: remaining battery
+energy, a running average cost-basis for the energy currently stored
+(Eq. 3 -- like FIFO/weighted-average-cost inventory accounting; realized
+profit only shows up in the reward when discharging), the current price,
+and an RNN hidden feature (see below). Bang-bang 3-action space
+(charge/discharge at the max feasible rate, or hold), matching Wang &
+Zhang's Lemma 1 that this paper cites directly. Reward is Eq. 4 --
+economically meaningful on its own (no separate "shaped reward vs. true
+profit" split needed, unlike some sibling projects in this collection: the
+paper states the discharge-reward terms alone sum to total realized
+arbitrage profit).
+
+`src/price_encoder.py` -- an EMA filter (Eq. 6) feeding a single-layer RNN
+(Eq. 7), trained via its own auxiliary next-price-prediction loss (Eq. 8),
+entirely separate from the RL reward. Implemented with `nn.RNN` rather
+than a manual per-timestep loop -- mathematically identical, but running
+4000 steps of backprop-through-time over a ~6,500-hour training sequence in
+a pure Python loop would be far too slow.
+
+`src/ppo_agent.py` -- separate actor and critic networks (2 hidden layers,
+128 and 32 units), GAE (Eq. 12), and the clipped surrogate objective
+(Eq. 9-10) -- Algorithm 1. Each of the paper's K=200 outer updates collects
+D=10 independent one-week (168h) trajectories from randomly sampled
+starting points in the training data, battery reset to empty each time.
+
+`src/qlearning_baseline.py` -- the paper's own comparison point: Wang &
+Zhang's Q-learning discretized into 100 price bins x 10 energy bins (not
+the 10x9 binning from `qlearning_realtime_arbitrage_2018` -- that was tuned
+for a different paper's case study). Uses the identical environment/reward
+as PPO, so the two are compared on equal footing.
+
+## Train
+
+```bash
+venv/bin/python3 train.py --data data/train/pjm_rto_rt_hourly_lmp_2018_train.csv
+```
+
+Trains Q-learning, PPO, and PPO-RNN (in that order; PPO-RNN pretrains the
+price encoder first). Takes roughly 35 minutes total at the paper's own
+scale (4000 encoder steps, K=200 PPO updates) -- timed directly, not a
+guess. Key flags: `--methods` (subset of `qlearning ppo ppo_rnn`, default
+all three), `--n-updates`/`--n-trajectories`/`--traj-len` (K/D/T in
+Algorithm 1), `--encoder-steps`, `--qlearning-price-bins`/
+`--qlearning-energy-bins`, `--wear-cost` (beta in Eq. 4, $/MW).
+
+## Evaluate
+
+```bash
+venv/bin/python3 evaluate.py --data data/test/pjm_rto_rt_hourly_lmp_2018_test.csv
+```
+
+Freezes all trained models (greedy, no exploration) and replays them on the
+held-out test split, reproducing the paper's Fig. 3-style comparison.
+
+## Deviations / assumptions (where the paper is ambiguous)
+
+- **Price encoder pretrained-then-frozen, not jointly trained with PPO.**
+  Section III-A's auxiliary loss is presented independently of Section
+  III-B's RL algorithm, and the paper doesn't state whether the two are
+  trained end-to-end together or the encoder is fixed before RL training
+  starts. Pretrain-then-freeze is the simpler reading and lets the hidden
+  state be precomputed once per price series rather than recomputed inside
+  every environment step (it depends only on the price sequence, never on
+  the agent's actions).
+- **Q-learning baseline's alpha/epsilon** aren't restated in this paper
+  (only cited by reference to Wang & Zhang); this project uses that paper's
+  own literal values (alpha=0.5, epsilon=0.9), but this paper's own
+  gamma=0.999 (rather than Wang & Zhang's 0.9) so Q-learning and PPO
+  optimize the same discounted objective on the same MDP.
+- **Q-learning's price bin *method*** defaults to causal quantile bins
+  (fit from a 30-day prefix), not equal-width -- the same reasoning as
+  `qlearning_realtime_arbitrage_2018`'s README documents in more detail:
+  real-time prices are heavy-tailed, and equal-width bins waste most of
+  the table on rarely-visited spikes. `--qlearning-price-bin-method
+  equal_width` is available for the more literal "100 price intervals"
+  reading.
+- **Single seed so far.** This collection's other projects found (and
+  rigorously confirmed with 100-trial paired testing in
+  `qlearning_realtime_arbitrage_2018`) that Q-learning-style exploration
+  noise can swing single-run results by an order of magnitude. The results
+  below are one seed each -- suggestive, not yet a statistically
+  trustworthy comparison. `train.py`/`evaluate.py` don't yet have
+  multi-trial support the way the sibling project does.
+
+## Known findings from this replication
+
+Trained on 2018 (Jan-Sep), evaluated on held-out 2018 (Oct-Dec), paper's
+own default hyperparameters (K=200, D=10, T=168h, 4000 encoder steps,
+gamma=0.999, wear cost beta=$1/MW):
+
+|  | Training (mean profit, final updates) | Held-out test (cumulative) |
+|---|---|---|
+| Q-learning | -$5,590.66 (one online pass) | +$4,825.60 |
+| PPO (no RNN) | ~$0 for ~160/200 updates, then breaks out to ~$340/week | +$3,586.16 |
+| PPO-RNN | ~$700-1,300/week from update 10 onward | **+$9,635.09** |
+
+**PPO-RNN's central claim replicates cleanly**: it clearly and
+substantially beats both other methods on held-out data (about 2x
+Q-learning, 2.7x plain PPO), matching the paper's own claim that PPO-RNN
+outperforms both by a wide margin. The *training-time* learning curves also
+show the qualitative pattern the paper describes: plain PPO stays stuck
+near zero profit for most of training before suddenly discovering a
+profitable policy late (paper Fig. 2 shows the same flat-then-breakout
+shape for PPO vs. Q-learning), while PPO-RNN finds a good policy almost
+immediately, presumably because the RNN's price-trend feature gives it a
+much easier signal to exploit than the raw instantaneous price alone.
+
+**Where it doesn't match**: the paper's own reported numbers have plain
+PPO beating Q-learning ($10,942 vs. $9,377 on the 2018 test quarter); this
+run shows the reverse (Q-learning $4,826 vs. PPO $3,586). Given the
+single-seed caveat above, this specific ordering flip between the two
+weaker methods isn't necessarily a real disagreement with the paper --
+it's exactly the kind of comparison this project's own sibling found to be
+unreliable without multiple seeds. PPO-RNN's win over both is large enough
+in this run to be a more believable signal on its own, but multi-seed
+testing (matching `qlearning_realtime_arbitrage_2018`'s pattern) is the
+natural next step before treating any of these numbers as solid.
+
 ## What's next
 
-The RL side of this replication (not yet built): the MDP environment
-(state = remaining energy, average energy cost basis, current price, and
-the EMA+RNN hidden state; 3-action bang-bang charge/hold/discharge, per
-Lemma 1 in the earlier Wang & Zhang paper this project's data loader shares
-lineage with), the PPO agent with an RNN price-sequence encoder, and
-train/evaluate scripts that reproduce the paper's three-year benchmark
-against tabular Q-learning.
+- Multi-trial training/evaluation (multiple seeds), matching the rigor
+  `qlearning_realtime_arbitrage_2018` eventually reached, before treating
+  the Q-learning-vs-PPO ordering as settled either way.
+- Run 2016 and 2017 (the paper's other two case-study years) the same way.
+- Compare against this paper's own reported profit figures more directly
+  once multiple seeds are available.
