@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/
+
+# Source paper PDF kept locally for reference, not pushed to GitHub -- see
+# the README for a link to the paper instead.
+*.pdf
+
+# Data files (downloaded/derived locally, not tracked) -- unlike some sibling
+# projects in this repo, none of this project's data is checked in. Only the
+# scripts that (re)generate it are tracked. This includes the raw daily JSON
+# cache, the full-column raw export, the cleaned combined CSV, and the
+# train/test splits.
+data/raw/*
+!data/raw/.gitkeep
+data/train/*
+!data/train/.gitkeep
+data/test/*
+!data/test/.gitkeep
+
+# Generated outputs: each run is fully self-contained under outputs/runs/
+# <timestamp>/. outputs/data_plots/ is the one exception -- raw price-series
+# plots aren't tied to any specific run.
+outputs/runs/*
+!outputs/runs/.gitkeep
+outputs/data_plots/*
+!outputs/data_plots/.gitkeep
