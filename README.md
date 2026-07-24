@@ -224,8 +224,7 @@ method.
   from +$4,826 to +$2,514 -- on identical code and data. `train.py`/
   `evaluate.py` now support `--n-trials N` (mean +/- std across N
   independent seeded trials, saved under `trial_NN/`), matching the sibling
-  project's approach; the numbers below still predate that flag (single
-  trial each) and haven't yet been re-run at `--n-trials > 1`.
+  project's approach -- see "Known findings" below for the 10-trial result.
 
 ### Two implementation gaps found and fixed during a train/test audit
 
@@ -268,45 +267,53 @@ section.
 
 Trained on 2018 (Jan-Sep), evaluated on held-out 2018 (Oct-Dec), paper's
 own default hyperparameters (K=200, D=10, T=168h, 4000 encoder steps,
-gamma=0.999, wear cost beta=$1/MW):
+gamma=0.999, wear cost beta=$1/MW), **10 independent seeded trials**
+(`--n-trials 10`, default `--seed 0` generating the 10 trial seeds):
 
-|  | Training (mean profit, final updates) | Held-out test (cumulative) |
+|  | Training (mean weekly profit, final updates; qlearning is cumulative) | Held-out test (cumulative, mean +/- std over 10 trials) |
 |---|---|---|
-| Q-learning | -$5,590.66 (one online pass) | +$4,825.60 |
-| PPO (no RNN) | ~$0 for ~160/200 updates, then breaks out to ~$340/week | +$3,586.16 |
-| PPO-RNN | ~$700-1,300/week from update 10 onward | **+$9,287.94** |
+| Q-learning | -$4,865.28 (std $2,881.01) | +$4,407.59 (std $1,104.65) |
+| PPO (no RNN) | +$541.45 (std $342.80) | +$2,186.87 (std $2,015.23) |
+| PPO-RNN | +$925.41 (std $194.02) | **+$8,727.58** (std $1,867.38) |
 
-(PPO-RNN's number reflects the two audit fixes above; Q-learning and PPO
-are numerically unchanged from before the fixes, as expected.)
+**PPO-RNN's central claim replicates cleanly, and now with real
+statistical footing.** A paired t-test across the 10 trials (each method's
+trial *i* sharing trial *i*'s seed) gives PPO-RNN beating Q-learning by a
+mean of $4,320/trial (t=5.08) and beating plain PPO by $6,541/trial
+(t=7.09) -- both overwhelming, not close calls. PPO-RNN also has the
+tightest relative spread of the three (std is ~21% of its mean, vs. Q-learning's
+25% and PPO's 92%), meaning it's also the *most reliable* of the three
+methods across seeds, not just the best on average.
 
-**PPO-RNN's central claim replicates cleanly**: it clearly and
-substantially beats both other methods on held-out data (about 1.9x
-Q-learning, 2.6x plain PPO), matching the paper's own claim that PPO-RNN
-outperforms both by a wide margin. The *training-time* learning curves also
-show the qualitative pattern the paper describes: plain PPO stays stuck
-near zero profit for most of training before suddenly discovering a
-profitable policy late (paper Fig. 2 shows the same flat-then-breakout
-shape for PPO vs. Q-learning), while PPO-RNN finds a good policy almost
-immediately, presumably because the RNN's price-trend feature gives it a
-much easier signal to exploit than the raw instantaneous price alone.
-
-**Where it doesn't match**: the paper's own reported numbers have plain
-PPO beating Q-learning ($10,942 vs. $9,377 on the 2018 test quarter); this
-run shows the reverse (Q-learning $4,826 vs. PPO $3,586). Given the
-single-seed caveat above, this specific ordering flip between the two
-weaker methods isn't necessarily a real disagreement with the paper --
-it's exactly the kind of comparison this project's own sibling found to be
-unreliable without multiple seeds. PPO-RNN's win over both is large enough
-in this run to be a more believable signal on its own, but multi-seed
-testing (matching `qlearning_realtime_arbitrage_2018`'s pattern) is the
-natural next step before treating any of these numbers as solid.
+**Where it doesn't match, and this is no longer just seed noise**: the
+paper's own reported numbers have plain PPO beating Q-learning ($10,942 vs.
+$9,377 on the 2018 test quarter); across these 10 trials, Q-learning beats
+PPO by a mean of $2,221/trial, and a paired t-test says that's a real,
+statistically significant effect (t=3.02) -- not an artifact of any one
+unlucky seed the way the earlier single-seed comparison was. Plain PPO's
+own held-out std ($2,015, on a mean of only $2,187) shows it's a
+high-variance method here regardless of average performance -- one trial
+lost money entirely (-$8) while another made $7,385. The likely
+explanations are still the unstated hyperparameters documented throughout
+this section (PPO's own learning rate, entropy bonus, network
+initialization scale, advantage normalization, etc. are never given in the
+paper) rather than an implementation bug -- the environment, reward,
+GAE, and clipped-objective math were all re-verified against the paper's
+equations during the audit that found and fixed the two gaps above, and no
+further discrepancies turned up there. But this is a genuine, now
+statistically-supported disagreement with the paper's reported ordering
+between the two weaker methods, not a caveat that disappears with more
+seeds -- it's plausible plain PPO in this paper benefits from
+hyperparameter choices this replication doesn't share, or that Wang &
+Zhang's Q-learning baseline (used identically in both papers) is simply a
+stronger competitor on PJM-RTO 2018 than it was in whatever tuning regime
+produced the paper's own numbers.
 
 ## What's next
 
-- Actually run `--n-trials > 1` at the paper's full scale (now supported,
-  but not yet exercised beyond a quick smoke test) and update the table
-  above with mean +/- std figures, before treating the Q-learning-vs-PPO
-  ordering as settled either way.
-- Run 2016 and 2017 (the paper's other two case-study years) the same way.
-- Compare against this paper's own reported profit figures more directly
-  once multiple seeds are available.
+- Run 2016 and 2017 (the paper's other two case-study years) with
+  `--n-trials 10` the same way, to see whether the Q-learning-beats-PPO
+  finding holds across years or is specific to 2018.
+- If it holds, consider a small hyperparameter sweep for plain PPO
+  specifically (learning rate, entropy bonus) to check whether it's tunable
+  out, since the paper doesn't state its own values.
