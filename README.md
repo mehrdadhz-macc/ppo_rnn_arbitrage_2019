@@ -173,14 +173,24 @@ all three), `--n-updates`/`--n-trajectories`/`--traj-len` (K/D/T in
 Algorithm 1), `--encoder-steps`, `--qlearning-price-bins`/
 `--qlearning-energy-bins`, `--wear-cost` (beta in Eq. 4, $/MW).
 
+`--n-trials N` runs N independent trials (each with its own seed, saved
+under `trial_NN/`) and reports each method's mean +/- std profit across
+trials -- see below for why single-trial numbers alone aren't trustworthy.
+`--seed` doesn't feed into any trial directly; it seeds an RNG that
+*generates* each trial's own seed, so the same `--seed` always reproduces
+the same set of trial seeds.
+
 ## Evaluate
 
 ```bash
 venv/bin/python3 evaluate.py --data data/test/pjm_rto_rt_hourly_lmp_2018_test.csv
 ```
 
-Freezes all trained models (greedy, no exploration) and replays them on the
-held-out test split, reproducing the paper's Fig. 3-style comparison.
+Freezes every trial's trained models (greedy, no exploration) and replays
+them on the held-out test split, reproducing the paper's Fig. 3-style
+comparison. Reports each method's mean +/- std held-out profit across all
+of the run's trials, and plots the mean curve with a +/- 1 std band per
+method.
 
 ## Deviations / assumptions (where the paper is ambiguous)
 
@@ -204,13 +214,18 @@ held-out test split, reproducing the paper's Fig. 3-style comparison.
   the table on rarely-visited spikes. `--qlearning-price-bin-method
   equal_width` is available for the more literal "100 price intervals"
   reading.
-- **Single seed so far.** This collection's other projects found (and
-  rigorously confirmed with 100-trial paired testing in
-  `qlearning_realtime_arbitrage_2018`) that Q-learning-style exploration
-  noise can swing single-run results by an order of magnitude. The results
-  below are one seed each -- suggestive, not yet a statistically
-  trustworthy comparison. `train.py`/`evaluate.py` don't yet have
-  multi-trial support the way the sibling project does.
+- **Seed sensitivity is real here too.** This collection's sibling project
+  (`qlearning_realtime_arbitrage_2018`) rigorously confirmed with 100-trial
+  paired testing that exploration/init noise can swing single-run results
+  by an order of magnitude. The same pattern shows up here: re-running with
+  `--seed 42` instead of the default 0 moved plain PPO's held-out profit
+  from +$3,586 down to essentially $0 (its training curve broke out early
+  that time, then collapsed late, instead of the reverse), and Q-learning
+  from +$4,826 to +$2,514 -- on identical code and data. `train.py`/
+  `evaluate.py` now support `--n-trials N` (mean +/- std across N
+  independent seeded trials, saved under `trial_NN/`), matching the sibling
+  project's approach; the numbers below still predate that flag (single
+  trial each) and haven't yet been re-run at `--n-trials > 1`.
 
 ### Two implementation gaps found and fixed during a train/test audit
 
@@ -288,9 +303,10 @@ natural next step before treating any of these numbers as solid.
 
 ## What's next
 
-- Multi-trial training/evaluation (multiple seeds), matching the rigor
-  `qlearning_realtime_arbitrage_2018` eventually reached, before treating
-  the Q-learning-vs-PPO ordering as settled either way.
+- Actually run `--n-trials > 1` at the paper's full scale (now supported,
+  but not yet exercised beyond a quick smoke test) and update the table
+  above with mean +/- std figures, before treating the Q-learning-vs-PPO
+  ordering as settled either way.
 - Run 2016 and 2017 (the paper's other two case-study years) the same way.
 - Compare against this paper's own reported profit figures more directly
   once multiple seeds are available.

@@ -1,8 +1,15 @@
-"""Greedily evaluate the trained Q-learning / PPO / PPO-RNN policies on held-out test data.
+"""Greedily evaluate every trial's trained Q-learning / PPO / PPO-RNN policies
+on held-out test data.
 
 Reproduces the paper's Fig. 3 comparison: cumulative profit of each method
-replayed on a year's held-out last-3-months test split, using each
-method's FROZEN, greedy (no exploration) policy.
+replayed on a year's held-out last-3-months test split, using each method's
+FROZEN, greedy (no exploration) policy.
+
+train.py's --n-trials saves one set of models per trial_NN/ subdirectory
+under the run. This script evaluates ALL of them per method and reports the
+mean +/- std held-out profit across trials -- the expected-value estimate,
+not any single trial's number (which, as this collection's sibling project
+found, can vary a lot just from the training seed).
 
 Usage:
     venv/bin/python3 evaluate.py --run outputs/runs/<timestamp> --data data/test/pjm_rto_rt_hourly_lmp_2018_test.csv
@@ -50,9 +57,9 @@ def rollout_cumulative_profit(env, choose_action):
     return np.array(curve)
 
 
-def evaluate_qlearning(run_dir, prices, env_kwargs):
-    q_path = run_dir / "qlearning_q_table.npy"
-    edges_path = run_dir / "qlearning_price_edges.npy"
+def evaluate_qlearning(trial_dir, prices, env_kwargs):
+    q_path = trial_dir / "qlearning_q_table.npy"
+    edges_path = trial_dir / "qlearning_price_edges.npy"
     if not q_path.exists():
         return None
     q_table = np.load(q_path)
@@ -72,8 +79,8 @@ def evaluate_qlearning(run_dir, prices, env_kwargs):
     return rollout_cumulative_profit(env, choose_action)
 
 
-def evaluate_ppo(run_dir, prices, env_kwargs):
-    model_path = run_dir / "ppo_model.pt"
+def evaluate_ppo(trial_dir, prices, env_kwargs):
+    model_path = trial_dir / "ppo_model.pt"
     if not model_path.exists():
         return None
     model = ActorCritic(state_dim=3)
@@ -90,7 +97,7 @@ def evaluate_ppo(run_dir, prices, env_kwargs):
     return rollout_cumulative_profit(env, choose_action)
 
 
-def evaluate_ppo_rnn(run_dir, train_prices, prices, env_kwargs, encoder_hidden_size, encoder_alpha):
+def evaluate_ppo_rnn(trial_dir, train_prices, prices, env_kwargs, encoder_hidden_size, encoder_alpha):
     """`train_prices` is prepended purely so the RNN's hidden state carries over
     continuously from where training left off (matching how train.py computes
     hidden states continuously over its own price series) -- the rollout below
@@ -99,8 +106,8 @@ def evaluate_ppo_rnn(run_dir, train_prices, prices, env_kwargs, encoder_hidden_s
     away the price-trend memory it would have accumulated by then in a genuinely
     continuous deployment.
     """
-    model_path = run_dir / "ppo_rnn_model.pt"
-    encoder_path = run_dir / "price_encoder.pt"
+    model_path = trial_dir / "ppo_rnn_model.pt"
+    encoder_path = trial_dir / "price_encoder.pt"
     if not model_path.exists() or not encoder_path.exists():
         return None
 
@@ -123,6 +130,17 @@ def evaluate_ppo_rnn(run_dir, train_prices, prices, env_kwargs, encoder_hidden_s
     return rollout_cumulative_profit(env, choose_action)
 
 
+EVALUATORS = {
+    "qlearning": lambda trial_dir, train_prices, prices, env_kwargs, args:
+        evaluate_qlearning(trial_dir, prices, env_kwargs),
+    "ppo": lambda trial_dir, train_prices, prices, env_kwargs, args:
+        evaluate_ppo(trial_dir, prices, env_kwargs),
+    "ppo_rnn": lambda trial_dir, train_prices, prices, env_kwargs, args:
+        evaluate_ppo_rnn(trial_dir, train_prices, prices, env_kwargs,
+                          args.encoder_hidden_size, args.encoder_alpha),
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run", default=None, help="Run directory (default: most recent under outputs/runs)")
@@ -143,26 +161,54 @@ def main():
     train_data_path = Path(args.train_data) if args.train_data else infer_train_path(args.data)
     _, train_prices = load_price_series(train_data_path)
     train_prices = train_prices.astype(np.float32)
-    print(f"Evaluating run {run_dir} on {len(prices)} held-out hours from {args.data}")
+
+    trial_dirs = sorted(run_dir.glob("trial_*"))
+    if not trial_dirs:
+        raise SystemExit(f"No trial_*/ subdirectories found in {run_dir} -- this run predates "
+                          f"train.py's --n-trials support; retrain to evaluate it here.")
+    print(f"Evaluating run {run_dir} ({len(trial_dirs)} trial(s)) on "
+          f"{len(prices)} held-out hours from {args.data}")
 
     env_kwargs = dict(capacity_mwh=args.capacity_mwh, max_rate_mw=args.max_rate_mw, wear_cost=args.wear_cost)
 
-    curves = {}
-    for name, curve in [
-        ("qlearning", evaluate_qlearning(run_dir, prices, env_kwargs)),
-        ("ppo", evaluate_ppo(run_dir, prices, env_kwargs)),
-        ("ppo_rnn", evaluate_ppo_rnn(run_dir, train_prices, prices, env_kwargs, args.encoder_hidden_size, args.encoder_alpha)),
-    ]:
-        if curve is not None:
-            curves[name] = curve
-            print(f"  {name}: held-out cumulative profit = ${curve[-1]:,.2f}")
-
     plt.figure(figsize=(9, 5))
-    for name, curve in curves.items():
-        plt.plot(curve, label=name)
+    eval_results = {}
+
+    for method, evaluator in EVALUATORS.items():
+        curves = []
+        for trial_dir in trial_dirs:
+            curve = evaluator(trial_dir, train_prices, prices, env_kwargs, args)
+            if curve is not None:
+                curves.append(curve)
+        if not curves:
+            continue
+
+        curves = np.stack(curves)  # (n_trials, n_hours)
+        mean_curve = curves.mean(axis=0)
+        std_curve = curves.std(axis=0)
+        final_profits = curves[:, -1]
+        mean_profit, std_profit = float(final_profits.mean()), float(final_profits.std())
+
+        print(f"  {method}: mean held-out profit over {len(curves)} trial(s) = "
+              f"${mean_profit:,.2f} (std ${std_profit:,.2f})")
+        for i, p in enumerate(final_profits):
+            print(f"    trial {i}: ${p:,.2f}")
+
+        eval_results[method] = {
+            "n_trials": len(curves),
+            "trial_final_profits": final_profits.tolist(),
+            "mean_final_profit": mean_profit,
+            "std_final_profit": std_profit,
+        }
+
+        hours = np.arange(len(mean_curve))
+        line, = plt.plot(hours, mean_curve, label=f"{method} (mean of {len(curves)} trials)")
+        plt.fill_between(hours, mean_curve - std_curve, mean_curve + std_curve,
+                          alpha=0.2, color=line.get_color(), label=f"{method} (+/- 1 std)")
+
     plt.xlabel("Time (hour)")
     plt.ylabel("Cumulative profit ($)")
-    plt.title("Held-out evaluation (greedy policy, frozen models)")
+    plt.title("Held-out evaluation -- mean +/- std across trials (greedy policy, frozen models)")
     plt.legend()
     plt.tight_layout()
 
@@ -170,8 +216,7 @@ def main():
     plt.savefig(out_path, dpi=150)
     print(f"Saved plot to {out_path}")
 
-    (run_dir / "eval_summary.json").write_text(json.dumps(
-        {"data": args.data, "results": {k: float(v[-1]) for k, v in curves.items()}}, indent=2))
+    (run_dir / "eval_summary.json").write_text(json.dumps({"data": args.data, "results": eval_results}, indent=2))
 
 
 if __name__ == "__main__":
