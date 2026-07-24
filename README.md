@@ -212,6 +212,43 @@ held-out test split, reproducing the paper's Fig. 3-style comparison.
   trustworthy comparison. `train.py`/`evaluate.py` don't yet have
   multi-trial support the way the sibling project does.
 
+### Two implementation gaps found and fixed during a train/test audit
+
+Prompted by held-out results not matching the paper's reported numbers,
+both `src/price_encoder.py` and `evaluate.py` were re-audited line-by-line
+against Eq. 6-8. Two real gaps (not just hyperparameter ambiguity) turned up:
+
+- **RNN hidden state was reset to a cold start at the train/test boundary
+  during evaluation.** `train.py` correctly computes the encoder's hidden
+  state `h_t` continuously over the whole training price series (as it
+  should -- `h_t` is meant to carry price-trend memory forward hour by
+  hour). But `evaluate.py`'s `evaluate_ppo_rnn` was calling
+  `compute_hidden_states` on the *test-only* price array, so the RNN
+  started evaluation from `h_0` with zero memory of the 9 months of prices
+  immediately preceding the test period -- a discontinuity that would never
+  occur in real deployment. Fixed by computing hidden states over the
+  training series concatenated with the test series, then using only the
+  test-period slice to build the evaluation environment (`evaluate.py`
+  now also loads the matching training CSV, inferred by filename
+  convention or overridable with `--train-data`).
+- **`h_0` was a hardcoded zero constant, not "randomly initialized" as the
+  paper states.** `nn.RNN` silently defaults to a zero initial hidden state
+  when none is passed. Fixed by making `h0` a learnable `nn.Parameter`
+  (randomly initialized, then optimized jointly with the rest of the
+  encoder during pretraining) -- the standard reading of "randomly
+  initialized" for a network component.
+
+Empirically, re-running training and evaluation with both fixes applied
+changed PPO-RNN's held-out result from $9,635.09 to $9,287.94 (Q-learning
+and plain PPO are unaffected, as expected -- neither uses the price
+encoder's hidden states, and indeed their numbers were unchanged to the
+cent). So these were real, worth-fixing deviations from the paper's stated
+methodology, but empirically a *minor* contributor to the gap between this
+replication's numbers and the paper's -- not the dominant explanation.
+The likelier dominant sources of the remaining gap are the unstated
+hyperparameters and single-seed noise already documented throughout this
+section.
+
 ## Known findings from this replication
 
 Trained on 2018 (Jan-Sep), evaluated on held-out 2018 (Oct-Dec), paper's
@@ -222,11 +259,14 @@ gamma=0.999, wear cost beta=$1/MW):
 |---|---|---|
 | Q-learning | -$5,590.66 (one online pass) | +$4,825.60 |
 | PPO (no RNN) | ~$0 for ~160/200 updates, then breaks out to ~$340/week | +$3,586.16 |
-| PPO-RNN | ~$700-1,300/week from update 10 onward | **+$9,635.09** |
+| PPO-RNN | ~$700-1,300/week from update 10 onward | **+$9,287.94** |
+
+(PPO-RNN's number reflects the two audit fixes above; Q-learning and PPO
+are numerically unchanged from before the fixes, as expected.)
 
 **PPO-RNN's central claim replicates cleanly**: it clearly and
-substantially beats both other methods on held-out data (about 2x
-Q-learning, 2.7x plain PPO), matching the paper's own claim that PPO-RNN
+substantially beats both other methods on held-out data (about 1.9x
+Q-learning, 2.6x plain PPO), matching the paper's own claim that PPO-RNN
 outperforms both by a wide margin. The *training-time* learning curves also
 show the qualitative pattern the paper describes: plain PPO stays stuck
 near zero profit for most of training before suddenly discovering a

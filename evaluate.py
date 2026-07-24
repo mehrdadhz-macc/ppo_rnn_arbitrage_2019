@@ -30,6 +30,12 @@ def latest_run_dir():
     return runs[-1]
 
 
+def infer_train_path(test_path):
+    """data/test/..._test.csv -> data/train/..._train.csv, by this project's naming convention."""
+    test_path = Path(test_path)
+    return Path(str(test_path).replace("/test/", "/train/").replace("_test.csv", "_train.csv"))
+
+
 def rollout_cumulative_profit(env, choose_action):
     state = env.reset()
     cumulative_profit = 0.0
@@ -84,7 +90,15 @@ def evaluate_ppo(run_dir, prices, env_kwargs):
     return rollout_cumulative_profit(env, choose_action)
 
 
-def evaluate_ppo_rnn(run_dir, prices, env_kwargs, encoder_hidden_size, encoder_alpha):
+def evaluate_ppo_rnn(run_dir, train_prices, prices, env_kwargs, encoder_hidden_size, encoder_alpha):
+    """`train_prices` is prepended purely so the RNN's hidden state carries over
+    continuously from where training left off (matching how train.py computes
+    hidden states continuously over its own price series) -- the rollout below
+    still only steps through `prices` (the test period). Without this, the RNN
+    would evaluate starting from a cold h_0 right at the test boundary, throwing
+    away the price-trend memory it would have accumulated by then in a genuinely
+    continuous deployment.
+    """
     model_path = run_dir / "ppo_rnn_model.pt"
     encoder_path = run_dir / "price_encoder.pt"
     if not model_path.exists() or not encoder_path.exists():
@@ -92,7 +106,8 @@ def evaluate_ppo_rnn(run_dir, prices, env_kwargs, encoder_hidden_size, encoder_a
 
     encoder = PriceEncoder(hidden_size=encoder_hidden_size, alpha=encoder_alpha)
     encoder.load_state_dict(torch.load(encoder_path))
-    hidden_states = compute_hidden_states(encoder, prices)
+    full_prices = np.concatenate([train_prices, prices])
+    hidden_states = compute_hidden_states(encoder, full_prices)[len(train_prices):]
 
     model = ActorCritic(state_dim=3 + encoder_hidden_size)
     model.load_state_dict(torch.load(model_path))
@@ -112,6 +127,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run", default=None, help="Run directory (default: most recent under outputs/runs)")
     parser.add_argument("--data", default="data/test/pjm_rto_rt_hourly_lmp_2018_test.csv")
+    parser.add_argument("--train-data", default=None,
+                         help="Training-split CSV, used only to give the PPO-RNN price encoder "
+                              "continuous history before the test period (default: inferred from --data)")
     parser.add_argument("--capacity-mwh", type=float, default=8.0)
     parser.add_argument("--max-rate-mw", type=float, default=2.0)
     parser.add_argument("--wear-cost", type=float, default=1.0)
@@ -122,6 +140,9 @@ def main():
     run_dir = Path(args.run) if args.run else latest_run_dir()
     _, prices = load_price_series(args.data)
     prices = prices.astype(np.float32)
+    train_data_path = Path(args.train_data) if args.train_data else infer_train_path(args.data)
+    _, train_prices = load_price_series(train_data_path)
+    train_prices = train_prices.astype(np.float32)
     print(f"Evaluating run {run_dir} on {len(prices)} held-out hours from {args.data}")
 
     env_kwargs = dict(capacity_mwh=args.capacity_mwh, max_rate_mw=args.max_rate_mw, wear_cost=args.wear_cost)
@@ -130,7 +151,7 @@ def main():
     for name, curve in [
         ("qlearning", evaluate_qlearning(run_dir, prices, env_kwargs)),
         ("ppo", evaluate_ppo(run_dir, prices, env_kwargs)),
-        ("ppo_rnn", evaluate_ppo_rnn(run_dir, prices, env_kwargs, args.encoder_hidden_size, args.encoder_alpha)),
+        ("ppo_rnn", evaluate_ppo_rnn(run_dir, train_prices, prices, env_kwargs, args.encoder_hidden_size, args.encoder_alpha)),
     ]:
         if curve is not None:
             curves[name] = curve

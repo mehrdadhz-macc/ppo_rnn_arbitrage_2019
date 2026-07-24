@@ -55,6 +55,11 @@ class PriceEncoder(nn.Module):
         self.rnn = nn.RNN(input_size=1, hidden_size=hidden_size, num_layers=1,
                            nonlinearity="tanh", batch_first=True)
         self.output_head = nn.Linear(hidden_size, 1)  # w_o, b_o (Eq. 8)
+        # Paper: "h_0 is randomly initialized." A learnable parameter (rather than a
+        # fixed zero constant) is the standard reading of "randomly initialized" for
+        # a network component -- it gets a random value like any other weight, then
+        # is optimized jointly with the rest of the encoder via the auxiliary loss.
+        self.h0 = nn.Parameter(torch.randn(1, hidden_size) * 0.1)
 
     def forward(self, rho_tilde):
         """rho_tilde: (T,) tensor, precomputed via compute_ema.
@@ -68,11 +73,11 @@ class PriceEncoder(nn.Module):
                    rho_tilde[t] in the auxiliary loss.
         """
         rnn_input = rho_tilde.view(1, -1, 1)  # (batch=1, seq=T, input_size=1)
-        hiddens, _ = self.rnn(rnn_input)  # h0 defaults to zeros; hiddens: (1, T, hidden_size)
+        h0 = self.h0.unsqueeze(0)  # (num_layers=1, batch=1, hidden_size)
+        hiddens, _ = self.rnn(rnn_input, h0)  # hiddens: (1, T, hidden_size)
         hiddens = hiddens.squeeze(0)
 
-        h0 = torch.zeros(1, self.hidden_size)
-        prev_hiddens = torch.cat([h0, hiddens[:-1]], dim=0)  # prev_hiddens[t] = h_t
+        prev_hiddens = torch.cat([self.h0, hiddens[:-1]], dim=0)  # prev_hiddens[t] = h_t
         preds = self.output_head(prev_hiddens).squeeze(-1)
         return hiddens, preds
 
